@@ -9,6 +9,8 @@ import (
 	"io"
 	"iter"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 
 	"google.golang.org/adk/model"
@@ -17,17 +19,29 @@ import (
 
 // LMStudioModel implements model.LLM interface using OpenAI-compatible endpoints.
 type LMStudioModel struct {
-	modelName string
-	baseURL   string
+	modelName          string
+	baseURL            string
+	defaultTemperature *float32
 }
 
 func NewLMStudioModel(modelName, baseURL string) *LMStudioModel {
 	if baseURL == "" {
 		baseURL = "http://localhost:1234"
 	}
+	var defaultTemp *float32
+	if tempStr := os.Getenv("TEMPERATURE"); tempStr != "" {
+		if val, err := strconv.ParseFloat(tempStr, 32); err == nil {
+			t := float32(val)
+			defaultTemp = &t
+		}
+	} else {
+		t := float32(0.0)
+		defaultTemp = &t
+	}
 	return &LMStudioModel{
-		modelName: modelName,
-		baseURL:   baseURL,
+		modelName:          modelName,
+		baseURL:            baseURL,
+		defaultTemperature: defaultTemp,
 	}
 }
 
@@ -36,10 +50,13 @@ func (m *LMStudioModel) Name() string {
 }
 
 type OpenAIChatRequest struct {
-	Model    string          `json:"model"`
-	Messages []OpenAIMessage `json:"messages"`
-	Stream   bool            `json:"stream"`
-	Tools    []OpenAITool    `json:"tools,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []OpenAIMessage `json:"messages"`
+	Stream      bool            `json:"stream"`
+	Tools       []OpenAITool    `json:"tools,omitempty"`
+	Temperature *float32        `json:"temperature,omitempty"`
+	TopP        *float32        `json:"top_p,omitempty"`
+	MaxTokens   *int32          `json:"max_tokens,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -146,8 +163,23 @@ func (m *LMStudioModel) GenerateContent(ctx context.Context, req *model.LLMReque
 			Stream:   stream,
 		}
 
-		if req.Config != nil && len(req.Config.Tools) > 0 {
-			openaiReq.Tools = convertToolsToOpenAI(req.Config.Tools)
+		if req.Config != nil {
+			if req.Config.Temperature != nil {
+				openaiReq.Temperature = req.Config.Temperature
+			} else {
+				openaiReq.Temperature = m.defaultTemperature
+			}
+			if req.Config.TopP != nil {
+				openaiReq.TopP = req.Config.TopP
+			}
+			if req.Config.MaxOutputTokens > 0 {
+				openaiReq.MaxTokens = &req.Config.MaxOutputTokens
+			}
+			if len(req.Config.Tools) > 0 {
+				openaiReq.Tools = convertToolsToOpenAI(req.Config.Tools)
+			}
+		} else {
+			openaiReq.Temperature = m.defaultTemperature
 		}
 
 		payloadBytes, err := json.Marshal(openaiReq)

@@ -129,7 +129,7 @@ func (tb *K8sToolbox) ListPods(ctx tool.Context, args ListPodsArgs) (ListPodsRes
 // 3. Get Pod Logs Tool
 type GetPodLogsArgs struct {
 	Namespace     string `json:"namespace" description:"Namespace of the pod"`
-	PodName       string `json:"podName" description:"Name of the pod"`
+	Name          string `json:"name" description:"Name of the pod"`
 	ContainerName string `json:"containerName" description:"Name of the container (optional if pod has only one container)"`
 	TailLines     *int64 `json:"tailLines" description:"Number of recent log lines to return (optional)"`
 }
@@ -150,7 +150,7 @@ func (tb *K8sToolbox) GetPodLogs(ctx tool.Context, args GetPodLogsArgs) (GetPodL
 		opts.TailLines = &defaultTail
 	}
 
-	req := tb.Clientset.CoreV1().Pods(args.Namespace).GetLogs(args.PodName, opts)
+	req := tb.Clientset.CoreV1().Pods(args.Namespace).GetLogs(args.Name, opts)
 	stream, err := req.Stream(ctx)
 	if err != nil {
 		return GetPodLogsResult{}, fmt.Errorf("failed to stream pod logs: %w", err)
@@ -169,7 +169,7 @@ func (tb *K8sToolbox) GetPodLogs(ctx tool.Context, args GetPodLogsArgs) (GetPodL
 // 4. Describe Pod Tool
 type DescribePodArgs struct {
 	Namespace string `json:"namespace" description:"Namespace of the pod"`
-	PodName   string `json:"podName" description:"Name of the pod"`
+	Name      string `json:"name" description:"Name of the pod"`
 }
 
 type ContainerState struct {
@@ -192,7 +192,7 @@ type DescribePodResult struct {
 }
 
 func (tb *K8sToolbox) DescribePod(ctx tool.Context, args DescribePodArgs) (DescribePodResult, error) {
-	pod, err := tb.Clientset.CoreV1().Pods(args.Namespace).Get(ctx, args.PodName, metav1.GetOptions{})
+	pod, err := tb.Clientset.CoreV1().Pods(args.Namespace).Get(ctx, args.Name, metav1.GetOptions{})
 	if err != nil {
 		return DescribePodResult{}, fmt.Errorf("failed to get pod details: %w", err)
 	}
@@ -236,7 +236,7 @@ func (tb *K8sToolbox) DescribePod(ctx tool.Context, args DescribePodArgs) (Descr
 
 	// Get events related to this pod
 	eventList, err := tb.Clientset.CoreV1().Events(args.Namespace).List(ctx, metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=Pod", args.PodName),
+		FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=Pod", args.Name),
 	})
 
 	events := make([]string, 0)
@@ -317,7 +317,7 @@ func (tb *K8sToolbox) GetEvents(ctx tool.Context, args GetEventsArgs) (GetEvents
 
 // 6. Get Object YAML Tool
 type GetObjectYAMLArgs struct {
-	Kind      string `json:"kind" description:"The Kind of the object (e.g. Pod, Service, Deployment, ReplicaSet, StatefulSet, DaemonSet, ConfigMap, Secret, Event, Ingress, PVC)"`
+	Kind      string `json:"kind" description:"The Kind of the object (e.g. Pod, Service, Deployment, ReplicaSet, StatefulSet, DaemonSet, ConfigMap, Secret, Event, Ingress, PVC, Job, CronJob)"`
 	Namespace string `json:"namespace" description:"The namespace of the object"`
 	Name      string `json:"name" description:"The name of the object"`
 }
@@ -363,8 +363,12 @@ func (tb *K8sToolbox) GetObjectYAML(ctx tool.Context, args GetObjectYAMLArgs) (G
 		obj, err = tb.Clientset.NetworkingV1().Ingresses(args.Namespace).Get(ctx, args.Name, metav1.GetOptions{})
 	case "persistentvolumeclaim", "persistentvolumeclaims", "pvc":
 		obj, err = tb.Clientset.CoreV1().PersistentVolumeClaims(args.Namespace).Get(ctx, args.Name, metav1.GetOptions{})
+	case "job", "jobs":
+		obj, err = tb.Clientset.BatchV1().Jobs(args.Namespace).Get(ctx, args.Name, metav1.GetOptions{})
+	case "cronjob", "cronjobs":
+		obj, err = tb.Clientset.BatchV1().CronJobs(args.Namespace).Get(ctx, args.Name, metav1.GetOptions{})
 	default:
-		return GetObjectYAMLResult{}, fmt.Errorf("unsupported resource kind %q. Supported kinds: Pod, Service, Deployment, ReplicaSet, StatefulSet, DaemonSet, ConfigMap, Secret, Event, Ingress, PVC", args.Kind)
+		return GetObjectYAMLResult{}, fmt.Errorf("unsupported resource kind %q. Supported kinds: Pod, Service, Deployment, ReplicaSet, StatefulSet, DaemonSet, ConfigMap, Secret, Event, Ingress, PVC, Job, CronJob", args.Kind)
 	}
 
 	if err != nil {

@@ -84,20 +84,16 @@ func main() {
 	tools = registeredTools
 
 	// 4. Create the LLM Agent
-	agentInstruction := `You are an expert Kubernetes triage debugger. Your goal is to help developers diagnose, inspect, and troubleshoot issues on their Kubernetes clusters.
-You have access to real-time cluster query tools.
+	agentInstruction := `You are an expert Kubernetes triage debugger. Your goal is to help developers diagnose, inspect, and troubleshoot warning events on their Kubernetes clusters.
+You MUST follow this triage checklist step-by-step:
+1. First, retrieve the raw configuration of the involved object as YAML using 'k8s_get_object_yaml'. You MUST call this tool immediately before writing any text or recommendations.
+2. If the object is a Pod, retrieve its container logs using 'k8s_get_pod_logs' to check for error traces or stack traces.
+3. Query other correlated events using 'k8s_get_events' filtered by the object's name to establish a timeline of issues.
+4. Compile your findings from the above tool responses and write a detailed analysis explaining the root cause and the exact remediation steps.
 
-Systematic Triage Guidelines:
-1. Scan for failed events (specifically Warning type events) using 'k8s_get_events' in the target namespace or across the cluster.
-2. For any significant warning event, you MUST retrieve the raw configuration of the involved object (e.g. Pod, Service, Deployment, ReplicaSet) as YAML using 'k8s_get_object_yaml'.
-3. Analyze the YAML configuration for configuration errors (e.g., mismatched port numbers, missing environment variables, invalid volume mounts, incorrect image tags).
-4. Query other correlated events around that same timeframe using 'k8s_get_events' filtered by the objectName to establish a timeline of what went wrong (e.g. failed scheduling followed by pod failure).
-5. If the object has container logs (i.e. if it is a Pod), pull the logs using 'k8s_get_pod_logs' to see stdout/stderr error traces.
-6. Provide a detailed summary to the user:
-   - The warning event details and timeline.
-   - Any configuration errors found in the YAML config.
-   - Any stack traces or logs.
-   - Clear steps to fix the issue.
+Strict Rules:
+- NEVER guess the root cause or output a triage analysis without executing 'k8s_get_object_yaml' first.
+- Calling tools to inspect the active resources is your primary task. Always call the tools before summarizing.
 `
 	k8sAgent, err := llmagent.New(llmagent.Config{
 		Name:        "k8s-triage-debugger",
@@ -206,14 +202,26 @@ func scanEvents(ctx context.Context, toolbox *k8stools.K8sToolbox, runnr *runner
 func triageEvent(ctx context.Context, runnr *runner.Runner, e corev1.Event, eventTime time.Time) {
 	fmt.Printf("%s[System]%s Warning event detected on %s/%s. Starting triage session...\n", colorGray, colorReset, e.InvolvedObject.Kind, e.InvolvedObject.Name)
 
+	maxToolCalls := 5
+	if maxStr := os.Getenv("MAX_TOOL_CALLS_PER_SESSION"); maxStr != "" {
+		if val, err := strconv.Atoi(maxStr); err == nil && val > 0 {
+			maxToolCalls = val
+		}
+	}
+
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	prompt := fmt.Sprintf("A Warning event was detected on object %s/%s in namespace %q.\n"+
 		"Reason: %s\n"+
 		"Message: %s\n"+
 		"Last Observed: %s\n"+
 		"Count: %d\n\n"+
+		"IMPORTANT: You MUST call k8s_get_object_yaml with the exact name %q and namespace %q. Do not change or translate the name (e.g. do not change \"failing\" to \"failed\").\n"+
 		"Please check the config of the object using k8s_get_object_yaml, pull its logs using k8s_get_pod_logs (if it's a pod), trace related events, and write a detailed analysis explaining the root cause and remedy.",
 		e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Namespace,
-		e.Reason, e.Message, eventTime.Format("2006-01-02 15:04:05"), e.Count)
+		e.Reason, e.Message, eventTime.Format("2006-01-02 15:04:05"), e.Count,
+		e.InvolvedObject.Name, e.Namespace)
 
 	userContent := &genai.Content{
 		Role:  "user",
@@ -236,20 +244,60 @@ func triageEvent(ctx context.Context, runnr *runner.Runner, e corev1.Event, even
 	reportBuilder.WriteString("-----------------------------------------\n")
 	reportBuilder.WriteString("🔍 AUTOMATED TRIAGE REPORT:\n")
 
-	for event, err := range runnr.Run(ctx, userID, sessionID, userContent, agent.RunConfig{}) {
+	toolCallCount := 0
+	seenToolCalls := make(map[string]bool)
+
+	for event, err := range runnr.Run(sessionCtx, userID, sessionID, userContent, agent.RunConfig{}) {
 		if err != nil {
 			reportBuilder.WriteString(fmt.Sprintf("\nTriage Error: %v\n", err))
 			break
 		}
 
 		if event.LLMResponse.Content != nil {
+			var isAborted bool
 			for _, part := range event.LLMResponse.Content.Parts {
 				if part.Text != "" {
 					reportBuilder.WriteString(part.Text)
 				}
 				if part.FunctionCall != nil {
+					toolCallCount++
+
+					// Serialize args for unique signature
+					argsBytes, _ := json.Marshal(part.FunctionCall.Args)
+					sig := fmt.Sprintf("%s:%s", part.FunctionCall.Name, string(argsBytes))
+
+					if seenToolCalls[sig] {
+						fmt.Printf("%s[System] [%s/%s] Loop detected! Tool %s already called with args %s. Aborting session.%s\n",
+							colorRed, e.InvolvedObject.Kind, e.InvolvedObject.Name, part.FunctionCall.Name, string(argsBytes), colorReset)
+						reportBuilder.WriteString(fmt.Sprintf("\n[⚡ Loop detected! Tool %s already called with args %s. Terminating run.]\n", part.FunctionCall.Name, string(argsBytes)))
+						cancel()
+						isAborted = true
+						break
+					}
+					seenToolCalls[sig] = true
+
+					if toolCallCount > maxToolCalls {
+						fmt.Printf("%s[System] [%s/%s] Exceeded maximum tool calls (%d). Aborting session.%s\n",
+							colorRed, e.InvolvedObject.Kind, e.InvolvedObject.Name, maxToolCalls, colorReset)
+						reportBuilder.WriteString(fmt.Sprintf("\n[⚡ Exceeded maximum tool calls limit (%d). Terminating run.]\n", maxToolCalls))
+						cancel()
+						isAborted = true
+						break
+					}
+
+					// Real-time tool invocation log
+					fmt.Printf("%s[System] [%s/%s] AI invoking tool: %s with args %v%s\n",
+						colorCyan, e.InvolvedObject.Kind, e.InvolvedObject.Name, part.FunctionCall.Name, part.FunctionCall.Args, colorReset)
 					reportBuilder.WriteString(fmt.Sprintf("\n[⚡ Running tool: %s with args %v]\n", part.FunctionCall.Name, part.FunctionCall.Args))
 				}
+				if part.FunctionResponse != nil {
+					// Real-time tool response log
+					fmt.Printf("%s[System] [%s/%s] Tool returned response: %s -> %v%s\n",
+						colorGreen, e.InvolvedObject.Kind, e.InvolvedObject.Name, part.FunctionResponse.Name, part.FunctionResponse.Response, colorReset)
+				}
+			}
+			if isAborted {
+				break
 			}
 		}
 	}
