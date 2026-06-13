@@ -1,0 +1,17 @@
+# Go binaries
+k8s-debugger
+*k8s-debugger-test
+test_lmstudio_tools
+
+# Local configuration files (contains sensitive webhooks, tokens, and custom local IPs)
+config.env
+
+# System-generated test logs, task outputs, and diagnostics
+*.log
+debug_out.txt
+triage_new.log
+
+# IDE and temporary directories
+.gemini/
+.idea/
+.vscode/
