@@ -33,10 +33,12 @@ type K8sToolbox struct {
 
 // NewK8sToolbox sets up a connection to the Kubernetes cluster and returns an initialized toolbox.
 func NewK8sToolbox() (*K8sToolbox, error) {
+	// Call getKubeClient helper to parse configs and construct REST clientset pointers.
 	clientset, err := getKubeClient()
 	if err != nil {
 		return nil, err
 	}
+	// Return the initialized struct pointing to our cluster clientset.
 	return &K8sToolbox{Clientset: clientset}, nil
 }
 
@@ -45,20 +47,23 @@ func NewK8sToolbox() (*K8sToolbox, error) {
 // 1. In-Cluster (if the debugger is running as a Pod inside the cluster).
 // 2. Out-of-Cluster (local execution using the user's ~/.kube/config file).
 func getKubeClient() (*kubernetes.Clientset, error) {
-	// Mode 1: Attempt to load the in-cluster config. This succeeds if the environment
-	// has the service account token mounted (default for Pods).
+	// Mode 1: Attempt to load the in-cluster config. This succeeds if the debugger is
+	// running inside a pod in a Kubernetes cluster, where the API service account token
+	// is automatically mounted at /var/run/secrets/kubernetes.io/serviceaccount/token.
 	if config, err := rest.InClusterConfig(); err == nil {
+		// If in-cluster config was successfully read, initialize the clientset with it.
 		return kubernetes.NewForConfig(config)
 	}
 
-	// Mode 2: Fall back to local kubeconfig configuration.
-	// Check the KUBECONFIG env variable first, otherwise default to ~/.kube/config.
+	// Mode 2: Fall back to local kubeconfig configuration (useful for local development).
+	// First, check the KUBECONFIG environment variable. If empty, locate the standard home path configuration.
 	kubeconfig := os.Getenv("KUBECONFIG")
 	if kubeconfig == "" {
 		if home := homedir.HomeDir(); home != "" {
 			kubeconfig = filepath.Join(home, ".kube", "config")
 		}
 	}
+	// If kubeconfig is still empty or can't be resolved, return an error.
 	if kubeconfig == "" {
 		return nil, fmt.Errorf("kubeconfig file path not found")
 	}
@@ -69,7 +74,7 @@ func getKubeClient() (*kubernetes.Clientset, error) {
 		return nil, fmt.Errorf("failed to build kubeconfig: %w", err)
 	}
 	
-	// Instantiate the Clientset interface.
+	// Instantiate the Kubernetes Clientset using the compiled configurations.
 	return kubernetes.NewForConfig(config)
 }
 
@@ -89,18 +94,21 @@ type ListNamespacesResult struct {
 
 // ListNamespaces queries the Kubernetes cluster API to get a list of all active namespaces.
 func (tb *K8sToolbox) ListNamespaces(ctx tool.Context, args ListNamespacesArgs) (ListNamespacesResult, error) {
-	// Call CoreV1 API to retrieve namespaces list.
+	// Call CoreV1 API to retrieve namespaces list. We pass the context for cancellations/timeouts
+	// and an empty ListOptions because we want all namespaces in the cluster without filter.
 	nsList, err := tb.Clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return ListNamespacesResult{}, fmt.Errorf("failed to list namespaces: %w", err)
 	}
 
-	// Extract the namespace names into a slice of strings.
+	// Pre-allocate slice capacity based on the namespace items returned for performance optimization.
 	namespaces := make([]string, 0, len(nsList.Items))
 	for _, ns := range nsList.Items {
+		// Extract only the name of each namespace object.
 		namespaces = append(namespaces, ns.Name)
 	}
 
+	// Return list wrapped in JSON-compatible response structure.
 	return ListNamespacesResult{Namespaces: namespaces}, nil
 }
 
@@ -134,25 +142,34 @@ type ListPodsResult struct {
 // ListPods lists pods inside the requested namespace (or all namespaces if empty).
 func (tb *K8sToolbox) ListPods(ctx tool.Context, args ListPodsArgs) (ListPodsResult, error) {
 	// Query the pods list. If args.Namespace is empty, it acts as all-namespaces.
+	// We pass the context for cancellations and list options.
 	podList, err := tb.Clientset.CoreV1().Pods(args.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return ListPodsResult{}, fmt.Errorf("failed to list pods: %w", err)
 	}
 
+	// Pre-allocate slice capacity for the simplified pod structures we will return to the LLM agent.
 	pods := make([]PodInfo, 0, len(podList.Items))
 	for _, pod := range podList.Items {
 		var restarts int32
 		var readyContainers int
 		var totalContainers = len(pod.Spec.Containers)
 
-		// Accumulate restart counts and readiness status across init and app containers.
+		// Accumulate restart counts and readiness status across all container statuses.
 		for _, status := range pod.Status.ContainerStatuses {
+			// RestartCount is tracked per container; sum them up for a total Pod restarts number.
 			restarts += status.RestartCount
 			if status.Ready {
 				readyContainers++
 			}
 		}
 
+		// Also check init container statuses if there are any, since their restarts could point to issues.
+		for _, status := range pod.Status.InitContainerStatuses {
+			restarts += status.RestartCount
+		}
+
+		// Append the snapshot structure to our results.
 		pods = append(pods, PodInfo{
 			Name:      pod.Name,
 			Namespace: pod.Namespace,
@@ -187,23 +204,27 @@ type GetPodLogsResult struct {
 // GetPodLogs fetches logs from the specified pod/container.
 func (tb *K8sToolbox) GetPodLogs(ctx tool.Context, args GetPodLogsArgs) (GetPodLogsResult, error) {
 	opts := &corev1.PodLogOptions{}
+	// If a specific container name was provided, tell the API we only want that container's logs.
 	if args.ContainerName != "" {
 		opts.Container = args.ContainerName
 	}
+	// Limit lines returned to avoid flooding prompt context and hitting LLM context size constraints.
 	if args.TailLines != nil {
 		opts.TailLines = args.TailLines
 	} else {
-		// Default to returning the last 100 log lines to avoid flooding prompt context.
+		// Default to returning the last 100 log lines.
 		defaultTail := int64(100)
 		opts.TailLines = &defaultTail
 	}
 
 	// Initiate the logs stream request to the cluster API.
 	req := tb.Clientset.CoreV1().Pods(args.Namespace).GetLogs(args.Name, opts)
+	// Open the stream. This establishes a TCP connection to the Kubernetes API server logs endpoint.
 	stream, err := req.Stream(ctx)
 	if err != nil {
 		return GetPodLogsResult{}, fmt.Errorf("failed to stream pod logs: %w", err)
 	}
+	// Ensure the stream reader is closed when we finish to prevent memory/connection leaks.
 	defer stream.Close()
 
 	// Read stream output into a memory buffer.
@@ -213,6 +234,7 @@ func (tb *K8sToolbox) GetPodLogs(ctx tool.Context, args GetPodLogsArgs) (GetPodL
 		return GetPodLogsResult{}, fmt.Errorf("failed to read pod logs stream: %w", err)
 	}
 
+	// Return the log stream lines as a plain string inside the result struct.
 	return GetPodLogsResult{Logs: buf.String()}, nil
 }
 
@@ -249,7 +271,7 @@ type DescribePodResult struct {
 
 // DescribePod collects diagnostic metrics, container status arrays, and event logs for a specific pod.
 func (tb *K8sToolbox) DescribePod(ctx tool.Context, args DescribePodArgs) (DescribePodResult, error) {
-	// Query pod details.
+	// Call Pods GET API to query the specified Pod resource.
 	pod, err := tb.Clientset.CoreV1().Pods(args.Namespace).Get(ctx, args.Name, metav1.GetOptions{})
 	if err != nil {
 		return DescribePodResult{}, fmt.Errorf("failed to get pod details: %w", err)
@@ -258,6 +280,36 @@ func (tb *K8sToolbox) DescribePod(ctx tool.Context, args DescribePodArgs) (Descr
 	// Map container statuses.
 	containers := make([]ContainerState, 0, len(pod.Status.ContainerStatuses))
 	for _, cs := range pod.Status.ContainerStatuses {
+		stateStr := "Unknown"
+		reason := ""
+		message := ""
+
+		// Determine the container's current state and extract reason details.
+		if cs.State.Waiting != nil {
+			stateStr = "Waiting"
+			reason = cs.State.Waiting.Reason
+			message = cs.State.Waiting.Message
+		} else if cs.State.Running != nil {
+			stateStr = "Running"
+		} else if cs.State.Terminated != nil {
+			stateStr = "Terminated"
+			reason = cs.State.Terminated.Reason
+			message = cs.State.Terminated.Message
+		}
+
+		// Append mapped state.
+		containers = append(containers, ContainerState{
+			Name:         cs.Name,
+			Ready:        cs.Ready,
+			RestartCount: cs.RestartCount,
+			State:        stateStr,
+			Reason:       reason,
+			Message:      message,
+		})
+	}
+
+	// Also check init container statuses if there are any.
+	for _, cs := range pod.Status.InitContainerStatuses {
 		stateStr := "Unknown"
 		reason := ""
 		message := ""
@@ -275,7 +327,7 @@ func (tb *K8sToolbox) DescribePod(ctx tool.Context, args DescribePodArgs) (Descr
 		}
 
 		containers = append(containers, ContainerState{
-			Name:         cs.Name,
+			Name:         "[Init] " + cs.Name,
 			Ready:        cs.Ready,
 			RestartCount: cs.RestartCount,
 			State:        stateStr,
@@ -284,9 +336,10 @@ func (tb *K8sToolbox) DescribePod(ctx tool.Context, args DescribePodArgs) (Descr
 		})
 	}
 
-	// Filter active pod conditions.
+	// Filter active pod conditions (e.g. PodScheduled, Ready, ContainersReady, Initialized).
 	conditions := make([]string, 0, len(pod.Status.Conditions))
 	for _, c := range pod.Status.Conditions {
+		// If condition status is True, append just type. Else append the specific reason why it is false.
 		if c.Status == corev1.ConditionTrue {
 			conditions = append(conditions, string(c.Type))
 		} else {
@@ -294,11 +347,13 @@ func (tb *K8sToolbox) DescribePod(ctx tool.Context, args DescribePodArgs) (Descr
 		}
 	}
 
-	// Retrieve event logs targeting this specific pod object.
+	// Retrieve event logs targeting this specific pod object. We build a selector
+	// to query only events where the involvedObject has kind=Pod and matches the pod name.
 	eventList, err := tb.Clientset.CoreV1().Events(args.Namespace).List(ctx, metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=Pod", args.Name),
 	})
 
+	// Format event list items for easy reading by the LLM agent.
 	events := make([]string, 0)
 	if err == nil {
 		for _, e := range eventList.Items {
@@ -306,6 +361,7 @@ func (tb *K8sToolbox) DescribePod(ctx tool.Context, args DescribePodArgs) (Descr
 		}
 	}
 
+	// Construct and return final DescribePodResult template.
 	return DescribePodResult{
 		Name:       pod.Name,
 		Namespace:  pod.Namespace,
@@ -344,17 +400,21 @@ type GetEventsResult struct {
 // GetEvents queries the event stream in the cluster, optionally filtering by object name.
 func (tb *K8sToolbox) GetEvents(ctx tool.Context, args GetEventsArgs) (GetEventsResult, error) {
 	opts := metav1.ListOptions{}
+	// If a specific object name filter is provided, restrict list using involvedObject.name query filter.
 	if args.ObjectName != "" {
 		opts.FieldSelector = fmt.Sprintf("involvedObject.name=%s", args.ObjectName)
 	}
 
+	// Query events list in the requested namespace. An empty namespace retrieves events cluster-wide.
 	eventList, err := tb.Clientset.CoreV1().Events(args.Namespace).List(ctx, opts)
 	if err != nil {
 		return GetEventsResult{}, fmt.Errorf("failed to list events: %w", err)
 	}
 
+	// Convert raw API event models list into streamlined EventInfo structures.
 	events := make([]EventInfo, 0, len(eventList.Items))
 	for _, e := range eventList.Items {
+		// Format timestamps to human-readable strings if they are populated.
 		firstTime := ""
 		if !e.FirstTimestamp.IsZero() {
 			firstTime = e.FirstTimestamp.Time.Format("2006-01-02 15:04:05")
@@ -364,6 +424,7 @@ func (tb *K8sToolbox) GetEvents(ctx tool.Context, args GetEventsArgs) (GetEvents
 			lastTime = e.LastTimestamp.Time.Format("2006-01-02 15:04:05")
 		}
 
+		// Append mapped structure fields.
 		events = append(events, EventInfo{
 			Namespace:      e.Namespace,
 			Type:           e.Type,
@@ -399,8 +460,9 @@ func (tb *K8sToolbox) GetObjectYAML(ctx tool.Context, args GetObjectYAMLArgs) (G
 	var obj any
 	var err error
 
-	// Normalize resource kind string.
+	// Normalize resource kind string for consistent switch matching.
 	kind := strings.ToLower(args.Kind)
+	// Query the appropriate endpoint depending on resource kind.
 	switch kind {
 	case "pod", "pods":
 		obj, err = tb.Clientset.CoreV1().Pods(args.Namespace).Get(ctx, args.Name, metav1.GetOptions{})
@@ -420,6 +482,7 @@ func (tb *K8sToolbox) GetObjectYAML(ctx tool.Context, args GetObjectYAMLArgs) (G
 		// Secrets must be redacted to prevent sensitive data from leaking into the LLM context.
 		s, getErr := tb.Clientset.CoreV1().Secrets(args.Namespace).Get(ctx, args.Name, metav1.GetOptions{})
 		if getErr == nil {
+			// Make a copy to avoid mutating active cache contents of the Kubernetes client.
 			sCopy := s.DeepCopy()
 			for k := range sCopy.Data {
 				sCopy.Data[k] = []byte("[REDACTED]")
@@ -442,6 +505,7 @@ func (tb *K8sToolbox) GetObjectYAML(ctx tool.Context, args GetObjectYAMLArgs) (G
 		return GetObjectYAMLResult{}, fmt.Errorf("unsupported resource kind %q. Supported kinds: Pod, Service, Deployment, ReplicaSet, StatefulSet, DaemonSet, ConfigMap, Secret, Event, Ingress, PVC, Job, CronJob", args.Kind)
 	}
 
+	// If the get request failed, return formatted error.
 	if err != nil {
 		return GetObjectYAMLResult{}, fmt.Errorf("failed to get %s %q in namespace %q: %w", args.Kind, args.Name, args.Namespace, err)
 	}
@@ -452,6 +516,7 @@ func (tb *K8sToolbox) GetObjectYAML(ctx tool.Context, args GetObjectYAMLArgs) (G
 		return GetObjectYAMLResult{}, fmt.Errorf("failed to marshal object to YAML: %w", err)
 	}
 
+	// Return YAML bytes formatted as a standard string.
 	return GetObjectYAMLResult{YAML: string(yamlBytes)}, nil
 }
 
@@ -465,7 +530,7 @@ func (tb *K8sToolbox) GetObjectYAML(ctx tool.Context, args GetObjectYAMLArgs) (G
 func RegisterAllTools(tb *K8sToolbox) ([]tool.Tool, error) {
 	var tools []tool.Tool
 
-	// 1. Register ListNamespaces
+	// 1. Register ListNamespaces: Maps ListNamespaces method to k8s_list_namespaces.
 	t1, err := functiontool.New(functiontool.Config{
 		Name:        "k8s_list_namespaces",
 		Description: "Lists all namespaces in the Kubernetes cluster",
@@ -475,7 +540,7 @@ func RegisterAllTools(tb *K8sToolbox) ([]tool.Tool, error) {
 	}
 	tools = append(tools, t1)
 
-	// 2. Register ListPods
+	// 2. Register ListPods: Maps ListPods method to k8s_list_pods.
 	t2, err := functiontool.New(functiontool.Config{
 		Name:        "k8s_list_pods",
 		Description: "Lists pods in a namespace, including names, status, IP, container readiness, and restarts.",
@@ -485,7 +550,7 @@ func RegisterAllTools(tb *K8sToolbox) ([]tool.Tool, error) {
 	}
 	tools = append(tools, t2)
 
-	// 3. Register GetPodLogs
+	// 3. Register GetPodLogs: Maps GetPodLogs method to k8s_get_pod_logs.
 	t3, err := functiontool.New(functiontool.Config{
 		Name:        "k8s_get_pod_logs",
 		Description: "Retrieves container logs for a pod in a namespace.",
@@ -495,7 +560,7 @@ func RegisterAllTools(tb *K8sToolbox) ([]tool.Tool, error) {
 	}
 	tools = append(tools, t3)
 
-	// 4. Register DescribePod
+	// 4. Register DescribePod: Maps DescribePod method to k8s_describe_pod.
 	t4, err := functiontool.New(functiontool.Config{
 		Name:        "k8s_describe_pod",
 		Description: "Gets details about a pod status, container states, phase, node name, conditions, and pod-specific events.",
@@ -505,7 +570,7 @@ func RegisterAllTools(tb *K8sToolbox) ([]tool.Tool, error) {
 	}
 	tools = append(tools, t4)
 
-	// 5. Register GetEvents
+	// 5. Register GetEvents: Maps GetEvents method to k8s_get_events.
 	t5, err := functiontool.New(functiontool.Config{
 		Name:        "k8s_get_events",
 		Description: "Retrieves recent event streams from a namespace or the entire cluster, optionally filtered by object name.",
@@ -515,7 +580,7 @@ func RegisterAllTools(tb *K8sToolbox) ([]tool.Tool, error) {
 	}
 	tools = append(tools, t5)
 
-	// 6. Register GetObjectYAML
+	// 6. Register GetObjectYAML: Maps GetObjectYAML method to k8s_get_object_yaml.
 	t6, err := functiontool.New(functiontool.Config{
 		Name:        "k8s_get_object_yaml",
 		Description: "Retrieves the raw YAML configuration of a Kubernetes object by Kind, Namespace, and Name.",
@@ -525,5 +590,6 @@ func RegisterAllTools(tb *K8sToolbox) ([]tool.Tool, error) {
 	}
 	tools = append(tools, t6)
 
+	// Return the completed collection of tools.
 	return tools, nil
 }

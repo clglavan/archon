@@ -46,26 +46,31 @@ const (
 )
 
 func main() {
+	// Root context used to monitor application lifecycle.
 	ctx := context.Background()
 
-	// Load configuration from local config.env file.
+	// Load configuration from local config.env file. This defines environment variables
+	// like LM_STUDIO_MODEL, POLL_INTERVAL_SECONDS, ALERT_TTL_SECONDS, etc.
 	loadEnvFile("config.env")
 
 	// 1. Retrieve and configure LM Studio settings.
+	// Check the environment for a custom model name; default to "magos-k8s-0.6b" if not configured.
 	lmStudioModelName := os.Getenv("LM_STUDIO_MODEL")
 	if lmStudioModelName == "" {
 		lmStudioModelName = "magos-k8s-0.6b"
 	}
 
+	// Retrieve local LM Studio REST endpoint; default to local port 1234.
 	lmStudioBaseURL := os.Getenv("LM_STUDIO_BASE_URL")
 	if lmStudioBaseURL == "" {
 		lmStudioBaseURL = "http://localhost:1234"
 	}
 
 	// 2. Initialize the model adapter wrapping the local LM Studio completions API.
+	// This wrapper implements the google.golang.org/adk/model.LLM interface.
 	modelAdapter := lmstudioproviders.NewLMStudioModel(lmStudioModelName, lmStudioBaseURL)
 
-	// Print visual dashboard header.
+	// Print visual dashboard header to make the terminal stdout clear and easy to follow.
 	fmt.Print(colorBold + colorCyan)
 	fmt.Println("==================================================================")
 	fmt.Println("       ☸️   KUBERNETES TRIAGE DEBUGGER DAEMON   ☸️")
@@ -83,6 +88,7 @@ func main() {
 
 	fmt.Printf("%s[System]%s Connected to cluster successfully! Registering diagnostic tools...\n", colorGray, colorReset)
 	// Register k8s query, log, describe, and yaml tools defined in k8stools package.
+	// These tools will be converted into JSON Schema schemas and passed to the LLM agent.
 	registeredTools, err := k8stools.RegisterAllTools(toolbox)
 	if err != nil {
 		log.Fatalf("Failed to register tools: %v", err)
@@ -106,6 +112,7 @@ Strict Rules:
 `
 	}
 	// Initialize the ADK LLM Agent with tools and instructions.
+	// This struct wraps the configurations, system prompts, and tool sets.
 	k8sAgent, err := llmagent.New(llmagent.Config{
 		Name:        "k8s-triage-debugger",
 		Model:       modelAdapter,
@@ -118,7 +125,8 @@ Strict Rules:
 	}
 
 	// 5. Initialize the ADK Runner.
-	// AutoCreateSession is set to true so session data structures are prepared automatically.
+	// The runner orchestrates chat history sessions and handles tool dispatch cycles.
+	// AutoCreateSession is set to true so session data structures are prepared automatically in memory.
 	runnr, err := runner.New(runner.Config{
 		AppName:           "k8s-triage-debugger",
 		Agent:             k8sAgent,
@@ -130,9 +138,10 @@ Strict Rules:
 	}
 
 	// 6. Set up the daemon monitoring polling loop parameters.
+	// We instantiate a cache to track active warning alerts so we don't spam duplicate tickets.
 	alertCache := make(map[string]time.Time)
 
-	// Polling Interval: How frequently we scan the cluster for events.
+	// Polling Interval: How frequently we query the Kubernetes API for warning events.
 	pollInterval := 30 * time.Second
 	intervalStr := os.Getenv("POLL_INTERVAL_SECONDS")
 	if intervalStr != "" {
@@ -141,7 +150,7 @@ Strict Rules:
 		}
 	}
 
-	// Alert TTL: Deduplication window to suppress event flooding.
+	// Alert TTL: The time-to-live deduplication window to suppress event flooding.
 	ttlSeconds := 300
 	ttlStr := os.Getenv("ALERT_TTL_SECONDS")
 	if ttlStr != "" {
@@ -153,13 +162,14 @@ Strict Rules:
 
 	fmt.Printf("%s[System]%s Monitoring warning events every %s (Alert TTL: %s)...\n", colorGray, colorReset, pollInterval, alertTTL)
 
+	// Create a Go ticker to periodically wake up the event scan routine.
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
-	// Perform an initial event scan immediately on launch.
+	// Perform an initial event scan immediately on daemon start.
 	scanEvents(ctx, toolbox, runnr, alertCache, alertTTL)
 
-	// Daemon execution loop.
+	// Daemon execution loop. It runs indefinitely, waking up on ticker ticks or shutting down if the context is canceled.
 	for {
 		select {
 		case <-ctx.Done():
@@ -174,6 +184,7 @@ Strict Rules:
 // scanEvents lists cluster-wide warning events, deduplicates repeats, and triggers triage routines.
 func scanEvents(ctx context.Context, toolbox *k8stools.K8sToolbox, runnr *runner.Runner, alertCache map[string]time.Time, alertTTL time.Duration) {
 	// Clean up expired cache entries in alertCache to avoid memory leakage.
+	// We check if the current time is past the event's lock expiration timestamp.
 	now := time.Now()
 	for key, expireTime := range alertCache {
 		if now.After(expireTime) {
@@ -181,7 +192,7 @@ func scanEvents(ctx context.Context, toolbox *k8stools.K8sToolbox, runnr *runner
 		}
 	}
 
-	// Retrieve all events in all namespaces.
+	// Retrieve all events across all namespaces. An empty string passed to Events("") represents cluster-wide event lookup.
 	eventList, err := toolbox.Clientset.CoreV1().Events("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		fmt.Printf("%s[Error]%s Failed to list events: %v\n", colorRed, colorReset, err)
@@ -189,29 +200,30 @@ func scanEvents(ctx context.Context, toolbox *k8stools.K8sToolbox, runnr *runner
 	}
 
 	for _, e := range eventList.Items {
-		// Only triage events of Type "Warning" (e.g. Failed, BackOff, FailedScheduling).
+		// Filter event models: only triage events of Type "Warning" (e.g. Failed, BackOff, FailedScheduling, FailedMount).
 		if e.Type != "Warning" {
 			continue
 		}
 
-		// Retrieve correct timestamp fallback.
+		// Retrieve correct timestamp fallback. Some events use LastTimestamp, while others might only have CreationTimestamp.
 		eventTime := e.LastTimestamp.Time
 		if eventTime.IsZero() {
 			eventTime = e.CreationTimestamp.Time
 		}
 
-		// Create a unique key defining "the same warning event" to suppress alert floods.
+		// Create a unique key defining "the same warning event" (namespace + kind + name + reason) to suppress duplicate alert loops.
 		alertKey := fmt.Sprintf("%s/%s/%s/%s", e.Namespace, e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Reason)
 
-		// Skip if the alert signature is currently locked in the TTL window.
+		// Skip if the alert signature is currently locked/active in the TTL window to avoid duplicate execution.
 		if expireTime, exists := alertCache[alertKey]; exists && now.Before(expireTime) {
 			continue
 		}
 
-		// Insert/refresh warning in the alert cache.
+		// Insert/refresh warning signature lock in the alert cache.
 		alertCache[alertKey] = now.Add(alertTTL)
 
-		// Kick off the triage session as a concurrent goroutine.
+		// Kick off the triage session as a concurrent Go routine.
+		// This keeps the monitoring loop non-blocking so it doesn't get blocked by slow LLM inference stream calls.
 		go triageEvent(ctx, runnr, e, eventTime)
 	}
 }
@@ -252,10 +264,11 @@ func triageEvent(ctx context.Context, runnr *runner.Runner, e corev1.Event, even
 		Parts: []*genai.Part{{Text: prompt}},
 	}
 
+	// Generate a unique session ID based on the event UID.
 	sessionID := fmt.Sprintf("triage-%s", string(e.UID))
 	userID := "event-monitor"
 
-	// Prepare report buffer.
+	// Prepare report buffer containing event diagnostic metadata.
 	var reportBuilder strings.Builder
 	reportBuilder.WriteString("=========================================\n")
 	reportBuilder.WriteString("⚠️ KUBERNETES WARNING EVENT DETECTED\n")
@@ -272,7 +285,7 @@ func triageEvent(ctx context.Context, runnr *runner.Runner, e corev1.Event, even
 	toolCallCount := 0
 	seenToolCalls := make(map[string]bool)
 
-	// Stream model execution events.
+	// Stream model execution events. We range over the runner.Run channel iterator.
 	for event, err := range runnr.Run(sessionCtx, userID, sessionID, userContent, agent.RunConfig{}) {
 		if err != nil {
 			reportBuilder.WriteString(fmt.Sprintf("\nTriage Error: %v\n", err))
@@ -282,12 +295,12 @@ func triageEvent(ctx context.Context, runnr *runner.Runner, e corev1.Event, even
 		if event.LLMResponse.Content != nil {
 			var isAborted bool
 			for _, part := range event.LLMResponse.Content.Parts {
-				// 1. Text Response chunk
+				// 1. Text Response chunk: Append text generated by the model to our report.
 				if part.Text != "" {
 					reportBuilder.WriteString(part.Text)
 				}
 				
-				// 2. Tool Invocation chunk
+				// 2. Tool Invocation chunk: Process and monitor tools requested by the model.
 				if part.FunctionCall != nil {
 					toolCallCount++
 
@@ -295,22 +308,25 @@ func triageEvent(ctx context.Context, runnr *runner.Runner, e corev1.Event, even
 					argsBytes, _ := json.Marshal(part.FunctionCall.Args)
 					sig := fmt.Sprintf("%s:%s", part.FunctionCall.Name, string(argsBytes))
 
-					// Loop Guard: If same tool is called with same parameters twice.
+					// Loop Guard: If the model requests the exact same tool name with the exact same arguments twice.
 					if seenToolCalls[sig] {
 						fmt.Printf("%s[System] [%s/%s] Loop detected! Tool %s already called with args %s. Aborting session.%s\n",
 							colorRed, e.InvolvedObject.Kind, e.InvolvedObject.Name, part.FunctionCall.Name, string(argsBytes), colorReset)
 						reportBuilder.WriteString(fmt.Sprintf("\n[⚡ Loop detected! Tool %s already called with args %s. Terminating run.]\n", part.FunctionCall.Name, string(argsBytes)))
+						// Trigger context cancellation to stop any ongoing HTTP requests/streams.
 						cancel()
 						isAborted = true
 						break
 					}
+					// Add this tool signature to our history map.
 					seenToolCalls[sig] = true
 
-					// Max Steps Guard: If too many tool calls are performed.
+					// Max Steps Guard: If the agent attempts to run more tools than allowed.
 					if toolCallCount > maxToolCalls {
 						fmt.Printf("%s[System] [%s/%s] Exceeded maximum tool calls (%d). Aborting session.%s\n",
 							colorRed, e.InvolvedObject.Kind, e.InvolvedObject.Name, maxToolCalls, colorReset)
 						reportBuilder.WriteString(fmt.Sprintf("\n[⚡ Exceeded maximum tool calls limit (%d). Terminating run.]\n", maxToolCalls))
+						// Trigger context cancellation.
 						cancel()
 						isAborted = true
 						break
@@ -322,7 +338,7 @@ func triageEvent(ctx context.Context, runnr *runner.Runner, e corev1.Event, even
 					reportBuilder.WriteString(fmt.Sprintf("\n[⚡ Running tool: %s with args %v]\n", part.FunctionCall.Name, part.FunctionCall.Args))
 				}
 				
-				// 3. Tool Response chunk
+				// 3. Tool Response chunk: Catch tool outputs to log them to stdout.
 				if part.FunctionResponse != nil {
 					// Print visual real-time green log when the tool yields its metrics back.
 					fmt.Printf("%s[System] [%s/%s] Tool returned response: %s -> %v%s\n",
@@ -343,13 +359,16 @@ func triageEvent(ctx context.Context, runnr *runner.Runner, e corev1.Event, even
 
 // sendGoogleChat dispatches alerts to Google Chat webhook URLs.
 func sendGoogleChat(url, text string) error {
+	// Construct the chat request body map.
 	payload := map[string]string{"text": text}
 	body, _ := json.Marshal(payload)
+	// Dispatch POST request to Google Chat webhook.
 	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	// Return failure details if webhook returns non-200 status code.
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("google chat status %d: %s", resp.StatusCode, string(b))
@@ -359,17 +378,20 @@ func sendGoogleChat(url, text string) error {
 
 // sendTelegram dispatches alerts to Telegram chat channels.
 func sendTelegram(token, chatID, text string) error {
+	// Format Telegram Bot API endpoint.
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 	payload := map[string]any{
 		"chat_id": chatID,
 		"text":    text,
 	}
 	body, _ := json.Marshal(payload)
+	// Dispatch POST request to Telegram endpoint.
 	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	// Return failure details if webhook returns non-200 status code.
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("telegram status %d: %s", resp.StatusCode, string(b))
@@ -407,12 +429,14 @@ func dispatchAlerts(report string) {
 // loadEnvFile parses key=val configuration lines inside .env files.
 // It supports both single-line variables, escaped \n characters, and natural multiline values enclosed in quotes.
 func loadEnvFile(path string) {
+	// Open the specified env configuration file.
 	file, err := os.Open(path)
 	if err != nil {
 		return // Ignore if the env file does not exist.
 	}
 	defer file.Close()
 
+	// Instantiate scanner to parse file lines.
 	scanner := bufio.NewScanner(file)
 	var activeKey string
 	var activeVal strings.Builder
@@ -432,6 +456,7 @@ func loadEnvFile(path string) {
 					activeVal.WriteString("\n")
 				}
 				activeVal.WriteString(content)
+				// Set the accumulated multiline string into system environment parameters.
 				os.Setenv(activeKey, activeVal.String())
 				inMultiLine = false
 				activeKey = ""
@@ -449,7 +474,7 @@ func loadEnvFile(path string) {
 			continue // Skip blank lines and comment markers.
 		}
 
-		// Split line into Key and Value parts
+		// Split line into Key and Value parts around the first '=' character.
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
 			continue
@@ -461,19 +486,19 @@ func loadEnvFile(path string) {
 		if len(val) > 0 && (val[0] == '"' || val[0] == '\'') {
 			quote := val[0]
 			if len(val) > 1 && val[len(val)-1] == quote {
-				// Single line with quotes
+				// Single line value wrapped in matching quotes.
 				val = val[1 : len(val)-1]
 				val = strings.ReplaceAll(val, `\n`, "\n")
 				os.Setenv(key, val)
 			} else {
-				// Start of a multiline block
+				// Start of a multiline block detected.
 				inMultiLine = true
 				quoteChar = quote
 				activeKey = key
 				activeVal.WriteString(val[1:])
 			}
 		} else {
-			// Unquoted or standard single-line value
+			// Unquoted or standard single-line value. Map escaped newlines.
 			val = strings.ReplaceAll(val, `\n`, "\n")
 			os.Setenv(key, val)
 		}
